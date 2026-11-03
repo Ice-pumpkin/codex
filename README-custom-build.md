@@ -4,6 +4,8 @@ This repository keeps a small downstream patch for OpenAI Codex. A scheduled Git
 
 If the patch no longer applies, the tests fail, the build fails, or the official npm platform package does not match the release, the workflow stops before publishing. Review the failed run, update `patches/immediate-rate-limit-retry.patch` against the new upstream release, and rerun the workflow with **Actions → Custom Codex builds → Run workflow**.
 
+The first retry starts immediately for HTTP 429, streamed rate limits, temporary usage limits with a reset time, and HTTP 402 messages that identify a quota and its reset. If the server keeps rejecting requests, retries continue after 1, 2, 4, 8, 16, 32, then at most 60 seconds per attempt, independently of `stream_max_retries`. They do not wait until the advertised reset time. You can interrupt the turn normally. Actual access still depends on the server accepting the request. Other failures retain upstream behavior, including terminal credit and workspace spend limits.
+
 ## Install a release
 
 Choose the latest `codex-immediate-vX.Y.Z` release in this repository and download the package for your platform.

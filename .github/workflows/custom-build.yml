@@ -40,6 +40,7 @@ jobs:
       upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
       version: ${{ steps.resolve.outputs.version }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_exists: ${{ steps.resolve.outputs.release_exists }}
       skip: ${{ steps.resolve.outputs.skip }}
     steps:
       - name: Resolve the latest stable OpenAI Codex release
@@ -241,9 +242,11 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: codex-rs
         env:
-          RUST_MIN_STACK: "8388608"
+          RUST_MIN_STACK: "16777216"
         shell: bash
-        run: "cargo test -p codex-core --test all retry_after:: --no-fail-fast"
+        run: |
+          cargo test -p codex-core --test all retry_after:: --no-fail-fast
+          cargo test -p codex-core --lib responses_retry::tests::
 
       - name: Configure the Rusty V8 build inputs
         env:
@@ -312,6 +315,7 @@ jobs:
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
           target_dir="${CARGO_TARGET_DIR:-target}"
           exe="${target_dir}/${CODEX_TARGET}/release/codex${suffix}"
+          exe="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().as_posix())' "$exe")"
           output="$("$exe" --version)"
           echo "$output"
           [[ "$output" == "codex-cli ${CODEX_VERSION}" ]]
