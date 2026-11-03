@@ -214,6 +214,28 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      - name: Configure host Rusty V8 inputs for Linux tests
+        if: runner.os == 'Linux'
+        env:
+          CODEX_UPSTREAM_SOURCE: ${{ github.workspace }}
+          TARGET: x86_64-unknown-linux-gnu
+        shell: bash
+        run: bash automation/scripts/setup-rusty-v8.sh
+
+      - name: Install native test build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Run focused retry tests on the Linux host
+        if: runner.os == 'Linux'
+        working-directory: codex-rs
+        shell: bash
+        run: "cargo test -p codex-core --test all retry_after:: --no-fail-fast"
+
       - name: Configure the Rusty V8 build inputs
         env:
           CODEX_UPSTREAM_SOURCE: ${{ github.workspace }}
@@ -263,13 +285,6 @@ jobs:
           [[ -f "$bwrap" ]] || { echo "Official bwrap helper not found: $bwrap" >&2; exit 1; }
           digest="$(sha256sum "$bwrap" | awk '{print $1}')"
           echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
-
-      - name: Run focused retry tests
-        working-directory: codex-rs
-        env:
-          LIBSQLITE3_FLAGS: ${{ runner.os == 'Windows' && 'SQLITE_DISABLE_INTRINSIC' || '' }}
-        shell: bash
-        run: "cargo test -p codex-core --test all retry_after:: --no-fail-fast"
 
       - name: Build the custom Codex executable
         working-directory: codex-rs

@@ -19,16 +19,21 @@ fi
 binding_name="src_binding_ptrcomp_sandbox_release_${TARGET}.rs"
 checksums_name="rusty_v8_ptrcomp_sandbox_release_${TARGET}.sha256"
 trusted_manifest="${CODEX_UPSTREAM_SOURCE}/third_party/v8/rusty_v8_${version//./_}_release_manifests.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum_command=(sha256sum --check -)
+else
+  checksum_command=(shasum -a 256 --check -)
+fi
 
 [[ -f "$trusted_manifest" ]] || {
   echo "Trusted V8 checksum manifest not found: $trusted_manifest" >&2
   exit 1
 }
 curl -fsSL "${base_url}/${checksums_name}" -o "${cache_dir}/${checksums_name}"
-expected_manifest_checksum="$(grep -F "  ${checksums_name}" "${trusted_manifest}" | awk '{print $1}')"
-actual_manifest_checksum="$(sha256sum "${cache_dir}/${checksums_name}" | awk '{print $1}')"
+expected_manifest_checksum="$(grep -F "  ${checksums_name}" "${trusted_manifest}" | cut -d ' ' -f 1)"
+actual_manifest_checksum="$(python3 -c 'import hashlib,pathlib,sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${cache_dir}/${checksums_name}")"
 [[ -n "$expected_manifest_checksum" && "$actual_manifest_checksum" == "$expected_manifest_checksum" ]] || {
-  echo "V8 checksum manifest did not match the source trust manifest" >&2
+  echo "V8 checksum manifest did not match the source trust manifest: expected ${expected_manifest_checksum:-missing}, got ${actual_manifest_checksum}" >&2
   exit 1
 }
 curl -fsSL "${base_url}/${archive_name}" -o "${cache_dir}/${archive_name}"
@@ -37,7 +42,7 @@ if [[ "$(wc -l < "${cache_dir}/${checksums_name}")" -ne 2 ]]; then
   echo "Expected two entries in ${checksums_name}" >&2
   exit 1
 fi
-(cd "${cache_dir}" && tr -d '\r' < "${checksums_name}" | sha256sum --check -)
+(cd "${cache_dir}" && tr -d '\r' < "${checksums_name}" | "${checksum_command[@]}")
 {
   echo "RUSTY_V8_ARCHIVE=${cache_dir}/${archive_name}"
   echo "RUSTY_V8_SRC_BINDING_PATH=${cache_dir}/${binding_name}"
