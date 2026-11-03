@@ -334,10 +334,9 @@ index 65aa293..a3dcf74 100644
      );
  
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 9d1d5ca..7170adb 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
-@@ -40,6 +40,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
+@@ -38,6 +38,7 @@
  use crate::responses_retry::ResponsesStreamRequest;
  use crate::responses_retry::ResponsesStreamRetryState;
  use crate::responses_retry::handle_response_stream_error;
@@ -345,7 +344,7 @@ index 9d1d5ca..7170adb 100644
  use crate::session::PreviousTurnSettings;
  use crate::session::TurnInput;
  use crate::session::daemon_recovery::RecordedTurnInput;
-@@ -1902,11 +1903,15 @@ async fn run_sampling_request(
+@@ -1844,11 +1845,15 @@
                      return Err(err);
                  }
                  CodexErrorDetails::UsageLimitReached(e) => {
@@ -360,8 +359,8 @@ index 9d1d5ca..7170adb 100644
 +                    }
 +                    err
                  }
-                 CodexErrorDetails::SessionBudgetExceeded | CodexErrorDetails::Fatal(_) => {
-                     return Err(err);
+                 _ => err,
+             },
 diff --git a/codex-rs/core/tests/suite/retry_after.rs b/codex-rs/core/tests/suite/retry_after.rs
 index 81bc8bc..bb05984 100644
 --- a/codex-rs/core/tests/suite/retry_after.rs
