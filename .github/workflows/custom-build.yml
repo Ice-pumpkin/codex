@@ -157,8 +157,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $cargoTargetDir = Join-Path $env:RUNNER_TEMP 'codex-cargo-target'
-          New-Item -ItemType Directory -Force -Path $cargoTargetDir | Out-Null
+          $cargoHome = 'D:\c'
+          $cargoTargetDir = 'D:\t'
+          New-Item -ItemType Directory -Force -Path $cargoHome, $cargoTargetDir | Out-Null
+          "CARGO_HOME=$cargoHome" | Add-Content -LiteralPath $env:GITHUB_ENV
           "CARGO_TARGET_DIR=$cargoTargetDir" | Add-Content -LiteralPath $env:GITHUB_ENV
           "CODEX_REPO_ROOT=$env:GITHUB_WORKSPACE" | Add-Content -LiteralPath $env:GITHUB_ENV
 
