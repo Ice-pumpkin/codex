@@ -334,9 +334,10 @@ index 65aa293..a3dcf74 100644
      );
  
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index e4a092e..4455b5b 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
-@@ -38,6 +38,7 @@
+@@ -38,6 +38,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
  use crate::responses_retry::ResponsesStreamRequest;
  use crate::responses_retry::ResponsesStreamRetryState;
  use crate::responses_retry::handle_response_stream_error;
@@ -344,7 +345,7 @@ diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.
  use crate::session::PreviousTurnSettings;
  use crate::session::TurnInput;
  use crate::session::daemon_recovery::RecordedTurnInput;
-@@ -1844,11 +1845,15 @@
+@@ -1844,11 +1845,15 @@ async fn run_sampling_request(
                      return Err(err);
                  }
                  CodexErrorDetails::UsageLimitReached(e) => {
@@ -362,7 +363,7 @@ diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.
                  _ => err,
              },
 diff --git a/codex-rs/core/tests/suite/retry_after.rs b/codex-rs/core/tests/suite/retry_after.rs
-index 81bc8bc..bb05984 100644
+index 81bc8bc..15a1207 100644
 --- a/codex-rs/core/tests/suite/retry_after.rs
 +++ b/codex-rs/core/tests/suite/retry_after.rs
 @@ -17,6 +17,7 @@ use codex_protocol::user_input::UserInput;
@@ -427,7 +428,7 @@ index 81bc8bc..bb05984 100644
 +            "error": {
 +                "type": "usage_limit_reached",
 +                "message": "The usage limit has been reached",
-+                "resets_at": 4102444800,
++                "resets_at": 4102444800_i64,
 +                "plan_type": "pro"
 +            }
 +        }))
@@ -589,7 +590,7 @@ index 81bc8bc..bb05984 100644
              layer: "stream".into(),
              operation: "remote_compaction_v2".into(),
          }
-@@ -855,11 +990,20 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
+@@ -855,11 +990,19 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
      Ok(())
  }
  
@@ -599,7 +600,6 @@ index 81bc8bc..bb05984 100644
  #[test_case::test_case(None, "Try again in 1 second."; "plaintext")]
 -#[tokio::test(flavor = "current_thread")]
 -async fn compact_v2_rate_limit_uses_server_advice(
-+#[test]
 +fn compact_v2_rate_limit_retries_immediately(
 +    error_header: Option<&'static str>,
 +    message: &'static str,
@@ -613,7 +613,7 @@ index 81bc8bc..bb05984 100644
      error_header: Option<&str>,
      message: &str,
  ) -> Result<()> {
-@@ -908,17 +1052,16 @@ async fn compact_v2_rate_limit_uses_server_advice(
+@@ -908,17 +1051,16 @@ async fn compact_v2_rate_limit_uses_server_advice(
  
      test.codex.submit(Op::Compact).await?;
      let retry = telemetry.next_retry().await;
@@ -633,7 +633,7 @@ index 81bc8bc..bb05984 100644
      wait_for_turn_completion(&test).await;
  
      let requests = response_mock.requests();
-@@ -1047,9 +1190,9 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
+@@ -1047,9 +1189,9 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
      Ok(())
  }
  
@@ -645,7 +645,7 @@ index 81bc8bc..bb05984 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1096,12 +1239,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
+@@ -1096,12 +1238,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
  
      submit_user_input(&test, "retry the rate-limited stream").await?;
      let retry = telemetry.next_retry().await;
@@ -659,7 +659,7 @@ index 81bc8bc..bb05984 100644
              layer: "stream".into(),
              operation: "sampling".into(),
          }
-@@ -1117,11 +1259,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
+@@ -1117,11 +1258,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
      Ok(())
  }
  
@@ -673,7 +673,7 @@ index 81bc8bc..bb05984 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1139,6 +1281,10 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+@@ -1139,6 +1280,10 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
                  code,
                  "Rate limit exceeded.",
              )),
@@ -684,7 +684,7 @@ index 81bc8bc..bb05984 100644
          ],
      )
      .await;
-@@ -1150,50 +1296,46 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+@@ -1150,50 +1295,46 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
          .build_with_auto_env(&server)
          .await?;
  
@@ -756,7 +756,7 @@ index 81bc8bc..bb05984 100644
      assert_eq!(
          telemetry.events.try_recv(),
          Err(mpsc::error::TryRecvError::Empty)
-@@ -1202,7 +1344,7 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+@@ -1202,7 +1343,7 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
      Ok(())
  }
  
@@ -765,7 +765,7 @@ index 81bc8bc..bb05984 100644
  #[test_case::test_case("rate_limit_exceeded", Some("1"), "Rate limit exceeded. Try again in 4 seconds."; "azure_style_header")]
  #[test_case::test_case("rate_limit_exceeded", None, "Rate limit exceeded. Try again in 1 second."; "azure_style_plaintext")]
  #[test_case::test_case("slow_down", Some("1"), "Please try again in 4.000s."; "slow_down_fractional_header")]
-@@ -1248,17 +1390,25 @@ async fn sse_failure_uses_server_advice(
+@@ -1248,17 +1389,25 @@ async fn sse_failure_uses_server_advice(
  
      submit_user_input(&test, "retry after the server's advice").await?;
      let retry = telemetry.next_retry().await;
@@ -794,7 +794,7 @@ index 81bc8bc..bb05984 100644
      wait_for_turn_completion(&test).await;
  
      assert_eq!(response_mock.requests().len(), 2);
-@@ -1733,7 +1883,7 @@ async fn websocket_connection_limit_retries_with_local_backoff() -> Result<()> {
+@@ -1733,7 +1882,7 @@ async fn websocket_connection_limit_retries_with_local_backoff() -> Result<()> {
  
  /// WebSocket failed-event headers take precedence over plaintext during an allowed retry.
  #[tokio::test(flavor = "current_thread")]
@@ -803,7 +803,7 @@ index 81bc8bc..bb05984 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1775,17 +1925,16 @@ async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Resu
+@@ -1775,17 +1924,16 @@ async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Resu
      submit_user_input(&test, "retry the rate-limited websocket stream").await?;
  
      let retry = telemetry.next_retry().await;
@@ -823,7 +823,7 @@ index 81bc8bc..bb05984 100644
      wait_for_turn_completion(&test).await;
  
      let connections = server.connections();
-@@ -1877,7 +2026,7 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
+@@ -1877,7 +2025,7 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
  
  /// Wrapped websocket rate limits honor nested advice.
  #[tokio::test(flavor = "current_thread")]
@@ -832,7 +832,7 @@ index 81bc8bc..bb05984 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1921,7 +2070,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+@@ -1921,7 +2069,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
      assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
      submit_user_input(&test, "recover from the websocket error").await?;
      let retry = telemetry.next_retry().await;
@@ -841,7 +841,7 @@ index 81bc8bc..bb05984 100644
      assert_eq!(
          (
              retry.attempt,
-@@ -1930,7 +2079,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+@@ -1930,7 +2078,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
          ),
          (1, "stream", "sampling")
      );
