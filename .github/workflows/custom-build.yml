@@ -1,0 +1,365 @@
+name: Custom Codex builds
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/custom-build.yml
+      - install/**
+      - patches/**
+      - scripts/package_custom_build.py
+      - scripts/test_package_custom_build.py
+      - scripts/setup-rusty-v8.sh
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Optional stable upstream tag such as rust-v0.166.0
+        required: false
+        type: string
+      rebuild:
+        description: Rebuild and replace this version's existing custom release
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-codex-build
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Resolve the latest stable OpenAI Codex release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          REBUILD: ${{ inputs.rebuild }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            upstream_tag="$REQUESTED_TAG"
+          else
+            upstream_tag="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              https://api.github.com/repos/openai/codex/releases/latest \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          fi
+
+          if [[ ! "$upstream_tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable rust-vX.Y.Z release tag, got: $upstream_tag" >&2
+            exit 1
+          fi
+
+          upstream_version="${upstream_tag#rust-v}"
+          git ls-remote --exit-code https://github.com/openai/codex.git \
+            "refs/tags/${upstream_tag}" "refs/tags/${upstream_tag}^{}" \
+            > "$RUNNER_TEMP/upstream-ref.txt"
+          upstream_sha="$(awk '$2 ~ /\^\{\}$/ { peeled=$1 } $2 !~ /\^\{\}$/ { direct=$1 } END { print peeled != "" ? peeled : direct }' \
+            "$RUNNER_TEMP/upstream-ref.txt")"
+          if [[ ! "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve upstream commit for $upstream_tag" >&2
+            exit 1
+          fi
+
+          release_tag="codex-immediate-v${upstream_version}"
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true
+            if [[ "$REBUILD" == true ]]; then
+              echo "Release $release_tag already exists; it will be rebuilt and its assets replaced."
+              skip=false
+            else
+              echo "Release $release_tag already exists; nothing to publish."
+              skip=true
+            fi
+          else
+            release_exists=false
+            skip=false
+          fi
+
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "upstream_sha=$upstream_sha"
+            echo "version=$upstream_version"
+            echo "release_tag=$release_tag"
+            echo "release_exists=$release_exists"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            npm_tag: linux-x64
+            runner: ubuntu-24.04
+          - target: x86_64-pc-windows-msvc
+            npm_tag: win32-x64
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      CODEX_TARGET: ${{ matrix.target }}
+      CODEX_NPM_TAG: ${{ matrix.npm_tag }}
+      CODEX_VERSION: ${{ needs.resolve.outputs.version }}
+      CODEX_UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+      CODEX_UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+    steps:
+      - name: Check out the upstream source release
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: openai/codex
+          ref: ${{ needs.resolve.outputs.upstream_sha }}
+          persist-credentials: false
+
+      - name: Check out this repository's patch and packaging tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            patches
+            install
+            scripts/package_custom_build.py
+            scripts/test_package_custom_build.py
+            scripts/setup-rusty-v8.sh
+            README-custom-build.md
+            LICENSE
+            NOTICE
+          sparse-checkout-cone-mode: false
+          path: automation
+
+      - name: Configure the upstream CI build environment
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-ci
+
+      - name: Configure a Windows Cargo build directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cargoTargetDir = Join-Path $env:RUNNER_TEMP 'codex-cargo-target'
+          New-Item -ItemType Directory -Force -Path $cargoTargetDir | Out-Null
+          "CARGO_TARGET_DIR=$cargoTargetDir" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CODEX_REPO_ROOT=$env:GITHUB_WORKSPACE" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Set up Python for package verification
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js for the official npm package
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22.x"
+
+      - name: Apply the immediate rate-limit retry patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check automation/patches/immediate-rate-limit-retry.patch
+          git apply automation/patches/immediate-rate-limit-retry.patch
+          git diff --check
+
+      - name: Test Linux and Windows package generation
+        shell: bash
+        run: python automation/scripts/test_package_custom_build.py
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+
+      - name: Use a hermetic Cargo home for Linux musl
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - name: Install Zig for the Linux musl build
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+          use-cache: false
+
+      - name: Configure the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Configure the Rusty V8 build inputs
+        env:
+          CODEX_UPSTREAM_SOURCE: ${{ github.workspace }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: bash automation/scripts/setup-rusty-v8.sh
+
+      - name: Install Linux musl build tools
+        if: runner.os == 'Linux'
+        working-directory: codex-rs
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: bash ../.github/scripts/install-musl-build-tools.sh
+
+      - name: Configure Linux musl environment
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+          target_no_jitter="AWS_LC_SYS_NO_JITTER_ENTROPY_${CODEX_TARGET//-/_}"
+          echo "${target_no_jitter}=1" >> "$GITHUB_ENV"
+
+      - name: Download the matching official npm platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          npm pack "@openai/codex@${CODEX_VERSION}-${CODEX_NPM_TAG}" \
+            --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/npm-pack.json"
+          tarball="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["filename"])' \
+            "$RUNNER_TEMP/npm-pack.json")"
+          mkdir -p "$RUNNER_TEMP/platform-package"
+          python3 - "$RUNNER_TEMP/$tarball" "$RUNNER_TEMP/platform-package" <<'PY'
+          import sys, tarfile
+          with tarfile.open(sys.argv[1], "r:gz") as archive:
+              archive.extractall(sys.argv[2], filter="data")
+          PY
+
+      - name: Pin the Linux sandbox helper to the matching official package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bwrap="$RUNNER_TEMP/platform-package/package/vendor/$CODEX_TARGET/codex-resources/bwrap"
+          [[ -f "$bwrap" ]] || { echo "Official bwrap helper not found: $bwrap" >&2; exit 1; }
+          digest="$(sha256sum "$bwrap" | awk '{print $1}')"
+          echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
+
+      - name: Run focused retry tests
+        working-directory: codex-rs
+        env:
+          LIBSQLITE3_FLAGS: ${{ runner.os == 'Windows' && 'SQLITE_DISABLE_INTRINSIC' || '' }}
+        shell: bash
+        run: "cargo test -p codex-core --test all retry_after:: --no-fail-fast"
+
+      - name: Build the custom Codex executable
+        working-directory: codex-rs
+        env:
+          LIBSQLITE3_FLAGS: ${{ runner.os == 'Windows' && 'SQLITE_DISABLE_INTRINSIC' || '' }}
+          STABLE_GIT_COMMIT: ${{ needs.resolve.outputs.upstream_sha }}
+        shell: bash
+        run: cargo build --target "$CODEX_TARGET" --release --bin codex
+
+      - name: Verify the built executable
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          target_dir="${CARGO_TARGET_DIR:-target}"
+          exe="${target_dir}/${CODEX_TARGET}/release/codex${suffix}"
+          output="$("$exe" --version)"
+          echo "$output"
+          [[ "$output" == "codex-cli ${CODEX_VERSION}" ]]
+          echo "CODEX_BUILT_EXECUTABLE=${exe}" >> "$GITHUB_ENV"
+
+      - name: Package the custom runtime and installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 automation/scripts/package_custom_build.py \
+            --platform-package "$RUNNER_TEMP/platform-package/package" \
+            --executable "$CODEX_BUILT_EXECUTABLE" \
+            --patch automation/patches/immediate-rate-limit-retry.patch \
+            --readme automation/README-custom-build.md \
+            --license automation/LICENSE \
+            --notice automation/NOTICE \
+            --target "$CODEX_TARGET" \
+            --npm-tag "$CODEX_NPM_TAG" \
+            --version "$CODEX_VERSION" \
+            --upstream-tag "$CODEX_UPSTREAM_TAG" \
+            --upstream-sha "$CODEX_UPSTREAM_SHA" \
+            --output "$RUNNER_TEMP/release"
+
+      - name: Upload the verified custom runtime
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-immediate-${{ matrix.target }}
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs:
+      - resolve
+      - build
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all custom runtime artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish the custom Codex release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_EXISTS: ${{ needs.resolve.outputs.release_exists }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+          CODEX_VERSION: ${{ needs.resolve.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/*)
+          [[ ${#assets[@]} -eq 6 ]] || {
+            echo "Expected two archives, two checksum files, and two build manifests; found ${#assets[@]} files." >&2
+            ls -la release-assets
+            exit 1
+          }
+          title="Codex ${CODEX_VERSION} with immediate rate-limit retries"
+          notes="Built from OpenAI Codex ${UPSTREAM_TAG}. The release includes Windows x64 and Linux x64 packages. The Linux x64 package supports x86_64 WSL distributions. Each package includes install and restore scripts, build metadata, and SHA-256 checksums."
+          if [[ "$RELEASE_EXISTS" == true ]]; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$title" --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --notes "$notes"
+          fi

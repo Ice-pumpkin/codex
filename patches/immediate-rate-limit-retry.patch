@@ -1,0 +1,274 @@
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+index 6a42146..c04f73a 100644
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -86,10 +86,21 @@ pub(crate) async fn handle_response_stream_error(
+         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
+     };
+     let retry_count = retry_state.retries.saturating_add(1);
++    let is_rate_limit = match err.details() {
++        CodexErrorDetails::RateLimitExceeded(_) => true,
++        CodexErrorDetails::RetryLimit(error) => error.status == http::StatusCode::TOO_MANY_REQUESTS,
++        _ => false,
++    };
+     let Some(delay) = err.retry_delay(retry_count) else {
+         return Err(err);
+     };
+-    let retry_after = err.retry_after();
++    // Retry rate limits immediately instead of waiting for server-provided reset advice.
++    let retry_after = if is_rate_limit {
++        None
++    } else {
++        err.retry_after()
++    };
++    let delay = if is_rate_limit { Duration::ZERO } else { delay };
+ 
+     if turn_context
+         .config
+diff --git a/codex-rs/core/tests/suite/retry_after.rs b/codex-rs/core/tests/suite/retry_after.rs
+index 81bc8bc..def6a40 100644
+--- a/codex-rs/core/tests/suite/retry_after.rs
++++ b/codex-rs/core/tests/suite/retry_after.rs
+@@ -341,9 +341,9 @@ async fn responses_http_uses_retry_after() -> Result<()> {
+     Ok(())
+ }
+ 
+-/// A 429 with server advice retries in the sampling loop and completes without a terminal error.
++/// A 429 with server advice retries immediately in the sampling loop.
+ #[tokio::test(flavor = "current_thread")]
+-async fn responses_http_429_uses_retry_after() -> Result<()> {
++async fn responses_http_429_retries_immediately() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let mut telemetry = RetryTelemetryCapture::install();
+@@ -371,17 +371,16 @@ async fn responses_http_429_uses_retry_after() -> Result<()> {
+ 
+     submit_user_input(&test, "retry the rate-limited request").await?;
+     let retry = telemetry.next_retry().await;
+-    assert!(retry.delay <= Duration::from_secs(1));
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: Duration::ZERO,
+             layer: "stream".into(),
+             operation: "sampling".into(),
+         }
+     );
+-    assert!(wait_for_retry(&mut telemetry, &retry).await >= Duration::from_secs(1));
++    wait_for_retry(&mut telemetry, &retry).await;
+     loop {
+         match wait_for_event(&test.codex, |_| true).await {
+             EventMsg::Error(error) => panic!("unexpected terminal error: {error:?}"),
+@@ -686,9 +685,9 @@ async fn compact_v2_uses_retry_after() -> Result<()> {
+     Ok(())
+ }
+ 
+-/// Remote compaction v2 stream failures retry without using the enclosing response header.
++/// Remote compaction rate limits retry immediately, regardless of response headers.
+ #[tokio::test(flavor = "current_thread")]
+-async fn compact_v2_stream_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
++async fn compact_v2_stream_rate_limit_retries_immediately() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let mut telemetry = RetryTelemetryCapture::install();
+@@ -731,12 +730,11 @@ async fn compact_v2_stream_failure_uses_local_backoff_despite_retry_after() -> R
+ 
+     test.codex.submit(Op::Compact).await?;
+     let retry = telemetry.next_retry().await;
+-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay));
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: Duration::ZERO,
+             layer: "stream".into(),
+             operation: "remote_compaction_v2".into(),
+         }
+@@ -800,12 +798,11 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
+ 
+     test.codex.submit(Op::Compact).await?;
+     let retry = telemetry.next_retry().await;
+-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay));
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: Duration::ZERO,
+             layer: "stream".into(),
+             operation: "remote_compaction_v2".into(),
+         }
+@@ -855,11 +852,11 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
+     Ok(())
+ }
+ 
+-/// Remote compaction honors message-only advice within its budget, with headers taking precedence.
++/// Remote compaction ignores message and header delays for rate-limit retries.
+ #[test_case::test_case(Some("1"), "Try again in 4 seconds."; "nested_header")]
+ #[test_case::test_case(None, "Try again in 1 second."; "plaintext")]
+ #[tokio::test(flavor = "current_thread")]
+-async fn compact_v2_rate_limit_uses_server_advice(
++async fn compact_v2_rate_limit_retries_immediately(
+     error_header: Option<&str>,
+     message: &str,
+ ) -> Result<()> {
+@@ -908,17 +905,16 @@ async fn compact_v2_rate_limit_uses_server_advice(
+ 
+     test.codex.submit(Op::Compact).await?;
+     let retry = telemetry.next_retry().await;
+-    assert!(retry.delay <= Duration::from_secs(1));
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: Duration::ZERO,
+             layer: "stream".into(),
+             operation: "remote_compaction_v2".into(),
+         }
+     );
+-    assert!(wait_for_retry(&mut telemetry, &retry).await >= Duration::from_secs(1));
++    wait_for_retry(&mut telemetry, &retry).await;
+     wait_for_turn_completion(&test).await;
+ 
+     let requests = response_mock.requests();
+@@ -1047,9 +1043,9 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
+     Ok(())
+ }
+ 
+-/// SSE failures currently retry with local backoff instead of the enclosing response header.
++/// Rate-limited SSE requests retry immediately despite server-provided retry advice.
+ #[tokio::test(flavor = "current_thread")]
+-async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
++async fn sse_rate_limit_retries_immediately() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let mut telemetry = RetryTelemetryCapture::install();
+@@ -1096,12 +1092,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
+ 
+     submit_user_input(&test, "retry the rate-limited stream").await?;
+     let retry = telemetry.next_retry().await;
+-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay));
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: Duration::ZERO,
+             layer: "stream".into(),
+             operation: "sampling".into(),
+         }
+@@ -1152,15 +1147,11 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+ 
+     submit_user_input(&test, "exhaust the headerless rate-limited stream").await?;
+     let retry = telemetry.next_retry().await;
+-    assert!(
+-        (FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay),
+-        "{retry:?}",
+-    );
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: Duration::ZERO,
+             layer: "stream".into(),
+             operation: "sampling".into(),
+         }
+@@ -1202,7 +1193,7 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+     Ok(())
+ }
+ 
+-/// Both sources survive to the agent's retry loop, and valid headers always beat message advice.
++/// Rate limits retry immediately, while overloads continue to use server retry advice.
+ #[test_case::test_case("rate_limit_exceeded", Some("1"), "Rate limit exceeded. Try again in 4 seconds."; "azure_style_header")]
+ #[test_case::test_case("rate_limit_exceeded", None, "Rate limit exceeded. Try again in 1 second."; "azure_style_plaintext")]
+ #[test_case::test_case("slow_down", Some("1"), "Please try again in 4.000s."; "slow_down_fractional_header")]
+@@ -1248,17 +1239,25 @@ async fn sse_failure_uses_server_advice(
+ 
+     submit_user_input(&test, "retry after the server's advice").await?;
+     let retry = telemetry.next_retry().await;
+-    assert!(retry.delay <= Duration::from_secs(1));
++    let expected_delay = if matches!(code, "rate_limit_exceeded" | "slow_down") {
++        Duration::ZERO
++    } else {
++        retry.delay
++    };
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: expected_delay,
+             layer: "stream".into(),
+             operation: "sampling".into(),
+         }
+     );
+-    assert!(wait_for_retry(&mut telemetry, &retry).await >= Duration::from_secs(1));
++    if expected_delay > Duration::ZERO {
++        assert!(wait_for_retry(&mut telemetry, &retry).await >= Duration::from_secs(1));
++    } else {
++        wait_for_retry(&mut telemetry, &retry).await;
++    }
+     wait_for_turn_completion(&test).await;
+ 
+     assert_eq!(response_mock.requests().len(), 2);
+@@ -1733,7 +1732,7 @@ async fn websocket_connection_limit_retries_with_local_backoff() -> Result<()> {
+ 
+ /// WebSocket failed-event headers take precedence over plaintext during an allowed retry.
+ #[tokio::test(flavor = "current_thread")]
+-async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Result<()> {
++async fn websocket_rate_limit_retries_immediately() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let mut telemetry = RetryTelemetryCapture::install();
+@@ -1775,17 +1774,16 @@ async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Resu
+     submit_user_input(&test, "retry the rate-limited websocket stream").await?;
+ 
+     let retry = telemetry.next_retry().await;
+-    assert!(retry.delay <= Duration::from_secs(1));
+     assert_eq!(
+         retry,
+         RetryTelemetryEvent {
+             attempt: 1,
+-            delay: retry.delay,
++            delay: Duration::ZERO,
+             layer: "stream".into(),
+             operation: "sampling".into(),
+         }
+     );
+-    assert!(wait_for_retry(&mut telemetry, &retry).await >= Duration::from_secs(1));
++    wait_for_retry(&mut telemetry, &retry).await;
+     wait_for_turn_completion(&test).await;
+ 
+     let connections = server.connections();
+@@ -1877,7 +1875,7 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
+ 
+ /// Wrapped websocket rate limits honor nested advice.
+ #[tokio::test(flavor = "current_thread")]
+-async fn websocket_error_uses_nested_retry_after() -> Result<()> {
++async fn websocket_rate_limit_retries_immediately_with_nested_advice() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let mut telemetry = RetryTelemetryCapture::install();
+@@ -1921,7 +1919,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+     assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
+     submit_user_input(&test, "recover from the websocket error").await?;
+     let retry = telemetry.next_retry().await;
+-    assert!(retry.delay <= Duration::from_secs(1));
++    assert_eq!(retry.delay, Duration::ZERO);
+     assert_eq!(
+         (
+             retry.attempt,
+@@ -1930,7 +1928,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+         ),
+         (1, "stream", "sampling")
+     );
+-    assert!(wait_for_retry(&mut telemetry, &retry).await >= Duration::from_secs(1));
++    wait_for_retry(&mut telemetry, &retry).await;
+     wait_for_turn_completion(&test).await;
+     assert_eq!(
+         server
