@@ -1,35 +1,380 @@
 diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
-index 6a42146..c04f73a 100644
+index 6a42146..fd4f038 100644
 --- a/codex-rs/core/src/responses_retry.rs
 +++ b/codex-rs/core/src/responses_retry.rs
-@@ -86,10 +86,21 @@ pub(crate) async fn handle_response_stream_error(
+@@ -22,6 +22,7 @@ use tracing::warn;
+ 
+ const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+ const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
++const MAX_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(60);
+ 
+ #[derive(Debug, Clone, Copy)]
+ pub(crate) enum ResponsesStreamRequest {
+@@ -31,6 +32,7 @@ pub(crate) enum ResponsesStreamRequest {
+ 
+ pub(crate) struct ResponsesStreamRetryState {
+     retries: u64,
++    rate_limit_retries: u64,
+     connection_retries: u64,
+     connection_retry_delay: Duration,
+ }
+@@ -39,6 +41,7 @@ impl Default for ResponsesStreamRetryState {
+     fn default() -> Self {
+         Self {
+             retries: 0,
++            rate_limit_retries: 0,
+             connection_retries: 0,
+             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
+         }
+@@ -86,11 +89,27 @@ pub(crate) async fn handle_response_stream_error(
          ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
      };
      let retry_count = retry_state.retries.saturating_add(1);
+-    let Some(delay) = err.retry_delay(retry_count) else {
++    let is_retryable_usage_limit = is_retryable_usage_limit(&err);
 +    let is_rate_limit = match err.details() {
 +        CodexErrorDetails::RateLimitExceeded(_) => true,
 +        CodexErrorDetails::RetryLimit(error) => error.status == http::StatusCode::TOO_MANY_REQUESTS,
 +        _ => false,
 +    };
-     let Some(delay) = err.retry_delay(retry_count) else {
++    let is_automatic_rate_limit =
++        is_rate_limit || is_retryable_usage_limit || is_resettable_quota_payment_error(&err);
++    let Some(delay) = (if is_automatic_rate_limit {
++        Some(rate_limit_retry_delay(retry_state.rate_limit_retries))
++    } else {
++        err.retry_delay(retry_count)
++    }) else {
          return Err(err);
      };
 -    let retry_after = err.retry_after();
-+    // Retry rate limits immediately instead of waiting for server-provided reset advice.
-+    let retry_after = if is_rate_limit {
+-
++    // Retry rate limits immediately, then use capped backoff instead of server reset advice.
++    let retry_after = if is_automatic_rate_limit {
 +        None
 +    } else {
 +        err.retry_after()
 +    };
-+    let delay = if is_rate_limit { Duration::ZERO } else { delay };
- 
      if turn_context
          .config
+         .features
+@@ -118,7 +137,8 @@ pub(crate) async fn handle_response_stream_error(
+         return Ok(());
+     }
+ 
+-    if retry_state.retries >= max_retries
++    if !is_automatic_rate_limit
++        && retry_state.retries >= max_retries
+         && client_session.try_switch_fallback_transport(
+             &turn_context.session_telemetry,
+             turn_context.model_info(),
+@@ -139,24 +159,35 @@ pub(crate) async fn handle_response_stream_error(
+         return Ok(());
+     }
+ 
+-    if retry_state.retries < max_retries {
++    if retry_state.retries < max_retries || is_automatic_rate_limit {
+         retry_state.retries = retry_count;
+-        log_retry(request, turn_context, &err, retry_count, max_retries, delay);
++        if is_automatic_rate_limit {
++            retry_state.rate_limit_retries = retry_state.rate_limit_retries.saturating_add(1);
++        }
++        log_retry(
++            request,
++            turn_context,
++            &err,
++            retry_count,
++            (!is_automatic_rate_limit).then_some(max_retries),
++            delay,
++        );
+ 
+         // In release builds, hide the first websocket retry notification to reduce noisy
+         // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
+-        let report_error = retry_count > 1
++        let report_error = is_automatic_rate_limit
++            || retry_count > 1
+             || cfg!(debug_assertions)
+             || !sess.services.model_client.responses_websocket_enabled();
+         if report_error {
+             // Surface retry information to any UI/front-end so the user understands what is
+             // happening instead of staring at a seemingly frozen screen.
+-            sess.notify_stream_error(
+-                turn_context,
+-                format!("Reconnecting... {retry_count}/{max_retries}"),
+-                err,
+-            )
+-            .await;
++            let message = if is_automatic_rate_limit {
++                format!("Rate limit reached. Retrying automatically (attempt {retry_count})")
++            } else {
++                format!("Reconnecting... {retry_count}/{max_retries}")
++            };
++            sess.notify_stream_error(turn_context, message, err).await;
+         }
+         // Use one clock sample so local backoff telemetry retains the selected delay.
+         let now = Instant::now();
+@@ -181,31 +212,105 @@ fn log_retry(
+     turn_context: &TurnContext,
+     err: &CodexErr,
+     retries: u64,
+-    max_retries: u64,
++    max_retries: Option<u64>,
+     delay: Duration,
+ ) {
++    let max_retries_value = max_retries.unwrap_or_default();
+     match request {
+         ResponsesStreamRequest::Sampling => {
+-            warn!(
+-                turn_id = %turn_context.sub_id,
+-                retries,
+-                max_retries,
+-                sampling_error = %err,
+-                "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+-            );
++            if let Some(max_retries) = max_retries {
++                warn!(
++                    turn_id = %turn_context.sub_id,
++                    retries,
++                    max_retries,
++                    sampling_error = %err,
++                    "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
++                );
++            } else {
++                warn!(
++                    turn_id = %turn_context.sub_id,
++                    retries,
++                    max_retries = max_retries_value,
++                    sampling_error = %err,
++                    "rate limit reached - retrying sampling request automatically ({retries} in {delay:?})...",
++                );
++            }
+         }
+         ResponsesStreamRequest::RemoteCompactionV2 => {
+-            warn!(
+-                turn_id = %turn_context.sub_id,
+-                retries,
+-                max_retries,
+-                compact_error = %err,
+-                "remote compaction v2 stream failed; retrying request after delay"
+-            );
++            if let Some(max_retries) = max_retries {
++                warn!(
++                    turn_id = %turn_context.sub_id,
++                    retries,
++                    max_retries,
++                    compact_error = %err,
++                    "remote compaction v2 stream failed; retrying request after delay"
++                );
++            } else {
++                warn!(
++                    turn_id = %turn_context.sub_id,
++                    retries,
++                    max_retries = max_retries_value,
++                    compact_error = %err,
++                    "remote compaction v2 reached a rate limit; retrying automatically"
++                );
++            }
+         }
+     }
+ }
+ 
++pub(crate) fn is_retryable_usage_limit(err: &CodexErr) -> bool {
++    let CodexErrorDetails::UsageLimitReached(error) = err.details() else {
++        return false;
++    };
++    if error.resets_at.is_none() {
++        return false;
++    }
++    !matches!(
++        error.rate_limit_reached_type,
++        Some(
++            codex_protocol::protocol::RateLimitReachedType::WorkspaceOwnerCreditsDepleted
++                | codex_protocol::protocol::RateLimitReachedType::WorkspaceMemberCreditsDepleted
++                | codex_protocol::protocol::RateLimitReachedType::WorkspaceOwnerUsageLimitReached
++                | codex_protocol::protocol::RateLimitReachedType::WorkspaceMemberUsageLimitReached
++        )
++    )
++}
++
++fn is_resettable_quota_payment_error(err: &CodexErr) -> bool {
++    let CodexErrorDetails::UnexpectedStatus(error) = err.details() else {
++        return false;
++    };
++    if error.status != http::StatusCode::PAYMENT_REQUIRED {
++        return false;
++    }
++    let body = error.body.to_lowercase();
++    let mentions_quota = [
++        "quota",
++        "usage limit",
++        "daily limit",
++        "limit exceeded",
++        "每日",
++        "额度",
++        "限额",
++        "用量",
++    ]
++    .iter()
++    .any(|phrase| body.contains(phrase));
++    let mentions_reset = ["reset", "重置", "恢复"]
++        .iter()
++        .any(|phrase| body.contains(phrase));
++    mentions_quota && mentions_reset
++}
++
++fn rate_limit_retry_delay(retries: u64) -> Duration {
++    if retries == 0 {
++        return Duration::ZERO;
++    }
++    Duration::from_secs(1)
++        .saturating_mul(1_u32 << retries.saturating_sub(1).min(6) as u32)
++        .min(MAX_RATE_LIMIT_RETRY_DELAY)
++}
++
+ #[cfg(test)]
+ #[path = "responses_retry_tests.rs"]
+ mod tests;
+diff --git a/codex-rs/core/src/responses_retry_tests.rs b/codex-rs/core/src/responses_retry_tests.rs
+index 65aa293..a3dcf74 100644
+--- a/codex-rs/core/src/responses_retry_tests.rs
++++ b/codex-rs/core/src/responses_retry_tests.rs
+@@ -1,18 +1,86 @@
+ use super::ResponsesStreamRequest;
+ use super::ResponsesStreamRetryState;
+ use super::handle_response_stream_error;
++use super::is_retryable_usage_limit;
+ use super::log_retry;
++use super::rate_limit_retry_delay;
+ use crate::realtime_history::RealtimeHistoryState;
+ use crate::session::step_context::StepContext;
+ use crate::session::tests::make_session_and_context;
++use chrono::TimeZone;
++use chrono::Utc;
+ use codex_http_client::RetryAfter;
+ use codex_protocol::error::CodexErr;
++use codex_protocol::error::UnexpectedResponseError;
++use codex_protocol::error::UsageLimitReachedError;
++use codex_protocol::protocol::RateLimitReachedType;
+ use std::sync::Arc;
+ use std::time::Duration;
+ use tokio::sync::Mutex;
+ use tokio::time::Instant;
+ use tracing_test::internal::MockWriter;
+ 
++fn usage_limit_error(
++    resets_at: Option<chrono::DateTime<Utc>>,
++    rate_limit_reached_type: Option<RateLimitReachedType>,
++) -> CodexErr {
++    CodexErr::UsageLimitReached(UsageLimitReachedError {
++        plan_type: None,
++        resets_at,
++        limit_window_minutes: None,
++        rate_limits: None,
++        promo_message: None,
++        rate_limit_reached_type,
++    })
++}
++
++#[test]
++fn temporary_usage_limit_retries_beyond_the_stream_budget() {
++    let reset = Utc.timestamp_opt(4_102_444_800, 0).unwrap();
++    assert!(is_retryable_usage_limit(&usage_limit_error(
++        Some(reset),
++        None
++    )));
++    assert!(!is_retryable_usage_limit(&usage_limit_error(None, None)));
++    assert!(!is_retryable_usage_limit(&usage_limit_error(
++        Some(reset),
++        Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached),
++    )));
++    assert_eq!(rate_limit_retry_delay(0), Duration::ZERO);
++    assert_eq!(rate_limit_retry_delay(1), Duration::from_secs(1));
++    assert_eq!(rate_limit_retry_delay(2), Duration::from_secs(2));
++    assert_eq!(rate_limit_retry_delay(7), Duration::from_secs(60));
++    assert_eq!(rate_limit_retry_delay(u64::MAX), Duration::from_secs(60));
++}
++
++#[test]
++fn only_resettable_quota_payment_errors_bypass_retry_after() {
++    let quota_error = CodexErr::UnexpectedStatus(UnexpectedResponseError {
++        status: http::StatusCode::PAYMENT_REQUIRED,
++        body: "每日额度超限：当前 $17.2433 USD（限制：$17.0000 USD）。将于 2026年11月04日 00:00:00 重置"
++            .to_string(),
++        user_message: None,
++        url: None,
++        cf_ray: None,
++        request_id: None,
++        identity_authorization_error: None,
++        identity_error_code: None,
++    });
++    assert!(super::is_resettable_quota_payment_error(&quota_error));
++
++    let payment_error = CodexErr::UnexpectedStatus(UnexpectedResponseError {
++        status: http::StatusCode::PAYMENT_REQUIRED,
++        body: "Payment required: update your billing information".to_string(),
++        user_message: None,
++        url: None,
++        cf_ray: None,
++        request_id: None,
++        identity_authorization_error: None,
++        identity_error_code: None,
++    });
++    assert!(!super::is_resettable_quota_payment_error(&payment_error));
++}
++
+ #[tokio::test]
+ async fn sampling_retry_logs_stream_error_context() {
+     let (_session, turn_context) = make_session_and_context().await;
+@@ -30,7 +98,7 @@ async fn sampling_retry_logs_stream_error_context() {
+         &turn_context,
+         &CodexErr::Stream("websocket closed by server before response.completed".to_string()),
+         /*retries*/ 2,
+-        /*max_retries*/ 5,
++        /*max_retries*/ Some(5),
+         Duration::from_secs(1),
+     );
+ 
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 9d1d5ca..7170adb 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -40,6 +40,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::responses_retry::ResponsesStreamRequest;
+ use crate::responses_retry::ResponsesStreamRetryState;
+ use crate::responses_retry::handle_response_stream_error;
++use crate::responses_retry::is_retryable_usage_limit;
+ use crate::session::PreviousTurnSettings;
+ use crate::session::TurnInput;
+ use crate::session::daemon_recovery::RecordedTurnInput;
+@@ -1902,11 +1903,15 @@ async fn run_sampling_request(
+                     return Err(err);
+                 }
+                 CodexErrorDetails::UsageLimitReached(e) => {
++                    let retryable_usage_limit = is_retryable_usage_limit(&err);
+                     let rate_limits = e.rate_limits.clone();
+                     if let Some(rate_limits) = rate_limits {
+                         sess.update_rate_limits(&turn_context, *rate_limits).await;
+                     }
+-                    return Err(err);
++                    if !retryable_usage_limit {
++                        return Err(err);
++                    }
++                    err
+                 }
+                 CodexErrorDetails::SessionBudgetExceeded | CodexErrorDetails::Fatal(_) => {
+                     return Err(err);
 diff --git a/codex-rs/core/tests/suite/retry_after.rs b/codex-rs/core/tests/suite/retry_after.rs
-index 81bc8bc..def6a40 100644
+index 81bc8bc..bb05984 100644
 --- a/codex-rs/core/tests/suite/retry_after.rs
 +++ b/codex-rs/core/tests/suite/retry_after.rs
-@@ -341,9 +341,9 @@ async fn responses_http_uses_retry_after() -> Result<()> {
+@@ -17,6 +17,7 @@ use codex_protocol::user_input::UserInput;
+ use core_test_support::responses;
+ use core_test_support::skip_if_no_network;
+ use core_test_support::test_codex::TestCodex;
++use core_test_support::test_codex::run_test_with_large_stack;
+ use core_test_support::test_codex::test_codex;
+ use core_test_support::wait_for_event;
+ use http::Method;
+@@ -341,9 +342,9 @@ async fn responses_http_uses_retry_after() -> Result<()> {
      Ok(())
  }
  
@@ -41,7 +386,7 @@ index 81bc8bc..def6a40 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -371,17 +371,16 @@ async fn responses_http_429_uses_retry_after() -> Result<()> {
+@@ -371,17 +372,16 @@ async fn responses_http_429_uses_retry_after() -> Result<()> {
  
      submit_user_input(&test, "retry the rate-limited request").await?;
      let retry = telemetry.next_retry().await;
@@ -61,7 +406,151 @@ index 81bc8bc..def6a40 100644
      loop {
          match wait_for_event(&test.codex, |_| true).await {
              EventMsg::Error(error) => panic!("unexpected terminal error: {error:?}"),
-@@ -686,9 +685,9 @@ async fn compact_v2_uses_retry_after() -> Result<()> {
+@@ -400,6 +400,143 @@ async fn responses_http_429_uses_retry_after() -> Result<()> {
+     Ok(())
+ }
+ 
++/// Temporary usage limits retry immediately and keep retrying beyond the configured stream budget.
++#[test]
++fn responses_http_usage_limit_retries_until_recovered() -> Result<()> {
++    run_test_with_large_stack("responses_http_usage_limit_retries_until_recovered", || {
++        responses_http_usage_limit_retries_until_recovered_async()
++    })
++}
++
++async fn responses_http_usage_limit_retries_until_recovered_async() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let mut telemetry = RetryTelemetryCapture::install();
++    let server = responses::start_mock_server().await;
++    let usage_limit = || {
++        ResponseTemplate::new(429).set_body_json(json!({
++            "error": {
++                "type": "usage_limit_reached",
++                "message": "The usage limit has been reached",
++                "resets_at": 4102444800,
++                "plan_type": "pro"
++            }
++        }))
++    };
++    let response_mock = responses::mount_response_sequence(
++        &server,
++        vec![
++            usage_limit(),
++            usage_limit(),
++            responses::sse_response(responses::sse(vec![
++                responses::ev_response_created("recovered"),
++                responses::ev_completed("recovered"),
++            ])),
++        ],
++    )
++    .await;
++    let test = test_codex()
++        .with_config(|config| {
++            config.model_provider.request_max_retries = Some(0);
++            config.model_provider.stream_max_retries = Some(0);
++        })
++        .build_with_auto_env(&server)
++        .await?;
++
++    submit_user_input(&test, "retry after the temporary usage limit").await?;
++    let first_retry = telemetry.next_retry().await;
++    assert_eq!(
++        first_retry,
++        RetryTelemetryEvent {
++            attempt: 1,
++            delay: Duration::ZERO,
++            layer: "stream".into(),
++            operation: "sampling".into(),
++        }
++    );
++    wait_for_retry(&mut telemetry, &first_retry).await;
++
++    let second_retry = telemetry.next_retry().await;
++    assert_eq!(
++        second_retry,
++        RetryTelemetryEvent {
++            attempt: 2,
++            delay: Duration::from_secs(1),
++            layer: "stream".into(),
++            operation: "sampling".into(),
++        }
++    );
++    wait_for_retry(&mut telemetry, &second_retry).await;
++    wait_for_turn_completion(&test).await;
++
++    assert_eq!(response_mock.requests().len(), 3);
++    assert_eq!(
++        telemetry.events.try_recv(),
++        Err(mpsc::error::TryRecvError::Empty)
++    );
++    Ok(())
++}
++
++/// A 402 quota error with reset advice retries immediately instead of waiting for the reset.
++#[test]
++fn responses_http_402_quota_retries_immediately() -> Result<()> {
++    run_test_with_large_stack("responses_http_402_quota_retries_immediately", || {
++        responses_http_402_quota_retries_immediately_async()
++    })
++}
++
++async fn responses_http_402_quota_retries_immediately_async() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let mut telemetry = RetryTelemetryCapture::install();
++    let server = responses::start_mock_server().await;
++    let response_mock = responses::mount_response_sequence(
++        &server,
++        vec![
++            ResponseTemplate::new(402)
++                .insert_header("Retry-After", "14400")
++                .set_body_json(json!({
++                    "error": {
++                        "message": "每日额度超限：当前 $17.2433 USD（限制：$17.0000 USD）。将于 2026年11月04日 00:00:00 (Asia/Shanghai) 重置"
++                    }
++                })),
++            responses::sse_response(responses::sse(vec![
++                responses::ev_response_created("recovered"),
++                responses::ev_completed("recovered"),
++            ])),
++        ],
++    )
++    .await;
++    let test = test_codex()
++        .with_config(|config| {
++            config.model_provider.request_max_retries = Some(0);
++            config.model_provider.stream_max_retries = Some(0);
++        })
++        .build_with_auto_env(&server)
++        .await?;
++
++    submit_user_input(&test, "retry after a temporary daily quota limit").await?;
++    let retry = telemetry.next_retry().await;
++    assert_eq!(
++        retry,
++        RetryTelemetryEvent {
++            attempt: 1,
++            delay: Duration::ZERO,
++            layer: "stream".into(),
++            operation: "sampling".into(),
++        }
++    );
++    wait_for_retry(&mut telemetry, &retry).await;
++    wait_for_turn_completion(&test).await;
++
++    assert_eq!(response_mock.requests().len(), 2);
++    assert_eq!(
++        telemetry.events.try_recv(),
++        Err(mpsc::error::TryRecvError::Empty)
++    );
++    Ok(())
++}
++
+ /// Check backoff without a live server or tracing events coordinating the retry loop.
+ #[tokio::test(start_paused = true)]
+ async fn http_retry_backoff_exhausts_attempts() {
+@@ -686,9 +823,9 @@ async fn compact_v2_uses_retry_after() -> Result<()> {
      Ok(())
  }
  
@@ -73,7 +562,7 @@ index 81bc8bc..def6a40 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -731,12 +730,11 @@ async fn compact_v2_stream_failure_uses_local_backoff_despite_retry_after() -> R
+@@ -731,12 +868,11 @@ async fn compact_v2_stream_failure_uses_local_backoff_despite_retry_after() -> R
  
      test.codex.submit(Op::Compact).await?;
      let retry = telemetry.next_retry().await;
@@ -87,7 +576,7 @@ index 81bc8bc..def6a40 100644
              layer: "stream".into(),
              operation: "remote_compaction_v2".into(),
          }
-@@ -800,12 +798,11 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
+@@ -800,12 +936,11 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
  
      test.codex.submit(Op::Compact).await?;
      let retry = telemetry.next_retry().await;
@@ -101,7 +590,7 @@ index 81bc8bc..def6a40 100644
              layer: "stream".into(),
              operation: "remote_compaction_v2".into(),
          }
-@@ -855,11 +852,11 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
+@@ -855,11 +990,20 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
      Ok(())
  }
  
@@ -109,13 +598,23 @@ index 81bc8bc..def6a40 100644
 +/// Remote compaction ignores message and header delays for rate-limit retries.
  #[test_case::test_case(Some("1"), "Try again in 4 seconds."; "nested_header")]
  #[test_case::test_case(None, "Try again in 1 second."; "plaintext")]
- #[tokio::test(flavor = "current_thread")]
+-#[tokio::test(flavor = "current_thread")]
 -async fn compact_v2_rate_limit_uses_server_advice(
-+async fn compact_v2_rate_limit_retries_immediately(
++#[test]
++fn compact_v2_rate_limit_retries_immediately(
++    error_header: Option<&'static str>,
++    message: &'static str,
++) -> Result<()> {
++    run_test_with_large_stack("compact_v2_rate_limit_retries_immediately", move || {
++        compact_v2_rate_limit_retries_immediately_async(error_header, message)
++    })
++}
++
++async fn compact_v2_rate_limit_retries_immediately_async(
      error_header: Option<&str>,
      message: &str,
  ) -> Result<()> {
-@@ -908,17 +905,16 @@ async fn compact_v2_rate_limit_uses_server_advice(
+@@ -908,17 +1052,16 @@ async fn compact_v2_rate_limit_uses_server_advice(
  
      test.codex.submit(Op::Compact).await?;
      let retry = telemetry.next_retry().await;
@@ -135,7 +634,7 @@ index 81bc8bc..def6a40 100644
      wait_for_turn_completion(&test).await;
  
      let requests = response_mock.requests();
-@@ -1047,9 +1043,9 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
+@@ -1047,9 +1190,9 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
      Ok(())
  }
  
@@ -147,7 +646,7 @@ index 81bc8bc..def6a40 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1096,12 +1092,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
+@@ -1096,12 +1239,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
  
      submit_user_input(&test, "retry the rate-limited stream").await?;
      let retry = telemetry.next_retry().await;
@@ -161,16 +660,46 @@ index 81bc8bc..def6a40 100644
              layer: "stream".into(),
              operation: "sampling".into(),
          }
-@@ -1152,15 +1147,11 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+@@ -1117,11 +1259,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
+     Ok(())
+ }
  
-     submit_user_input(&test, "exhaust the headerless rate-limited stream").await?;
-     let retry = telemetry.next_retry().await;
+-/// Headerless sampled stream rate limits exhaust retries before one terminal error.
++/// Headerless sampled stream rate limits continue beyond the configured retry budget.
+ #[test_case::test_case("rate_limit_exceeded"; "rate_limit")]
+ #[test_case::test_case("slow_down"; "slow_down")]
+ #[tokio::test(flavor = "current_thread")]
+-async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) -> Result<()> {
++async fn sse_failure_without_retry_after_retries_until_recovered(code: &str) -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let mut telemetry = RetryTelemetryCapture::install();
+@@ -1139,6 +1281,10 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+                 code,
+                 "Rate limit exceeded.",
+             )),
++            responses::sse_response(responses::sse(vec![
++                responses::ev_response_created("recovered"),
++                responses::ev_completed("recovered"),
++            ])),
+         ],
+     )
+     .await;
+@@ -1150,50 +1296,46 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+         .build_with_auto_env(&server)
+         .await?;
+ 
+-    submit_user_input(&test, "exhaust the headerless rate-limited stream").await?;
+-    let retry = telemetry.next_retry().await;
 -    assert!(
 -        (FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay),
 -        "{retry:?}",
 -    );
++    submit_user_input(&test, "retry the headerless rate-limited stream").await?;
++    let first_retry = telemetry.next_retry().await;
      assert_eq!(
-         retry,
+-        retry,
++        first_retry,
          RetryTelemetryEvent {
              attempt: 1,
 -            delay: retry.delay,
@@ -178,7 +707,57 @@ index 81bc8bc..def6a40 100644
              layer: "stream".into(),
              operation: "sampling".into(),
          }
-@@ -1202,7 +1193,7 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
+     );
+-    wait_for_retry(&mut telemetry, &retry).await;
++    wait_for_retry(&mut telemetry, &first_retry).await;
++
++    let second_retry = telemetry.next_retry().await;
++    assert_eq!(
++        second_retry,
++        RetryTelemetryEvent {
++            attempt: 2,
++            delay: Duration::from_secs(1),
++            layer: "stream".into(),
++            operation: "sampling".into(),
++        }
++    );
++    wait_for_retry(&mut telemetry, &second_retry).await;
+ 
+-    let mut error_events = 0;
+     let mut stream_error_events = 0;
+     loop {
+         match wait_for_event(&test.codex, |_| true).await {
+-            EventMsg::Error(error) => {
+-                error_events += 1;
+-                assert_eq!(
+-                    error.codex_error_info,
+-                    Some(CodexErrorInfo::RateLimitExceeded)
+-                );
+-                assert!(error.message.contains("Rate limit exceeded."));
+-            }
++            EventMsg::Error(error) => panic!("unexpected terminal error: {error:?}"),
+             EventMsg::StreamError(_) => stream_error_events += 1,
+             EventMsg::TurnComplete(event) => {
+-                assert_eq!(
+-                    event.error.and_then(|error| error.codex_error_info),
+-                    Some(CodexErrorInfo::RateLimitExceeded)
+-                );
++                assert_eq!(event.error, None);
+                 break;
+             }
+             _ => {}
+         }
+     }
+ 
+-    assert_eq!(error_events, 1);
+-    assert_eq!(stream_error_events, 1);
+-    assert_eq!(response_mock.requests().len(), 2);
++    assert_eq!(stream_error_events, 2);
++    assert_eq!(response_mock.requests().len(), 3);
+     assert_eq!(
+         telemetry.events.try_recv(),
+         Err(mpsc::error::TryRecvError::Empty)
+@@ -1202,7 +1344,7 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) ->
      Ok(())
  }
  
@@ -187,7 +766,7 @@ index 81bc8bc..def6a40 100644
  #[test_case::test_case("rate_limit_exceeded", Some("1"), "Rate limit exceeded. Try again in 4 seconds."; "azure_style_header")]
  #[test_case::test_case("rate_limit_exceeded", None, "Rate limit exceeded. Try again in 1 second."; "azure_style_plaintext")]
  #[test_case::test_case("slow_down", Some("1"), "Please try again in 4.000s."; "slow_down_fractional_header")]
-@@ -1248,17 +1239,25 @@ async fn sse_failure_uses_server_advice(
+@@ -1248,17 +1390,25 @@ async fn sse_failure_uses_server_advice(
  
      submit_user_input(&test, "retry after the server's advice").await?;
      let retry = telemetry.next_retry().await;
@@ -216,7 +795,7 @@ index 81bc8bc..def6a40 100644
      wait_for_turn_completion(&test).await;
  
      assert_eq!(response_mock.requests().len(), 2);
-@@ -1733,7 +1732,7 @@ async fn websocket_connection_limit_retries_with_local_backoff() -> Result<()> {
+@@ -1733,7 +1883,7 @@ async fn websocket_connection_limit_retries_with_local_backoff() -> Result<()> {
  
  /// WebSocket failed-event headers take precedence over plaintext during an allowed retry.
  #[tokio::test(flavor = "current_thread")]
@@ -225,7 +804,7 @@ index 81bc8bc..def6a40 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1775,17 +1774,16 @@ async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Resu
+@@ -1775,17 +1925,16 @@ async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Resu
      submit_user_input(&test, "retry the rate-limited websocket stream").await?;
  
      let retry = telemetry.next_retry().await;
@@ -245,7 +824,7 @@ index 81bc8bc..def6a40 100644
      wait_for_turn_completion(&test).await;
  
      let connections = server.connections();
-@@ -1877,7 +1875,7 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
+@@ -1877,7 +2026,7 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
  
  /// Wrapped websocket rate limits honor nested advice.
  #[tokio::test(flavor = "current_thread")]
@@ -254,7 +833,7 @@ index 81bc8bc..def6a40 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1921,7 +1919,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+@@ -1921,7 +2070,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
      assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
      submit_user_input(&test, "recover from the websocket error").await?;
      let retry = telemetry.next_retry().await;
@@ -263,7 +842,7 @@ index 81bc8bc..def6a40 100644
      assert_eq!(
          (
              retry.attempt,
-@@ -1930,7 +1928,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+@@ -1930,7 +2079,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
          ),
          (1, "stream", "sampling")
      );
