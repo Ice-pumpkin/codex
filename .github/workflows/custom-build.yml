@@ -1,4 +1,5 @@
 name: Custom Codex builds
+run-name: Custom Codex ${{ inputs.upstream_tag || 'latest stable' }}
 
 on:
   push:
