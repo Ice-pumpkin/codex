@@ -261,7 +261,25 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         shell: bash
-        run: bash ../.github/scripts/install-musl-build-tools.sh
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path("../.github/scripts/install-musl-build-tools.sh")
+          original = script.read_text(encoding="utf-8")
+          source = '  curl -fsSL "${libcap_download_url}" -o "${libcap_tarball}"'
+          replacement = '''  if ! curl --connect-timeout 20 --max-time 180 -fsSL "${libcap_download_url}" -o "${libcap_tarball}"; then
+              echo "Primary libcap mirror is unavailable; trying www.kernel.org." >&2
+              curl --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors --retry-delay 2 -fsSL \\
+                "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/${libcap_tarball_name}" \\
+                -o "${libcap_tarball}"
+            fi'''
+          if original.count(source) != 1:
+              raise SystemExit("Could not find exactly one expected libcap download command.")
+          script.write_text(original.replace(source, replacement), encoding="utf-8")
+          PY
+          bash ../.github/scripts/install-musl-build-tools.sh
 
       - name: Configure Linux musl environment
         if: runner.os == 'Linux'
