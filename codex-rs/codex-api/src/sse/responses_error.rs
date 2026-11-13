@@ -4,6 +4,7 @@
 use crate::error::ApiError;
 use crate::error::parse_terminal_provider_error;
 use crate::responses_headers::json_headers_to_http_headers;
+use chrono::DateTime;
 use codex_http_client::RetryAfter;
 use codex_protocol::protocol::MisalignmentErrorDetails;
 use serde::Deserialize;
@@ -29,6 +30,9 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
         .and_then(|error| error.get("headers"))
         .and_then(Value::as_object)
         .and_then(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)));
+    if let Some(error) = error.and_then(parse_resettable_rate_limit_error) {
+        return error;
+    }
     if let Some(error) = parse_terminal_provider_error(error, /*status*/ None) {
         return error;
     }
@@ -103,6 +107,38 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
             retry_after: retry_after_header,
         },
     }
+}
+
+pub(super) fn parse_resettable_rate_limit_error(error: &Value) -> Option<ApiError> {
+    if error.get("type").and_then(Value::as_str) != Some("rate_limit_error") {
+        return None;
+    }
+    if !error
+        .get("limit_type")
+        .and_then(Value::as_str)
+        .is_some_and(|limit_type| limit_type.to_ascii_lowercase().contains("quota"))
+    {
+        return None;
+    }
+    let is_resettable = error
+        .get("reset_time")
+        .and_then(Value::as_str)
+        .is_some_and(|reset_time| DateTime::parse_from_rfc3339(reset_time).is_ok());
+    if !is_resettable {
+        return None;
+    }
+    let retry_after = error
+        .get("headers")
+        .and_then(Value::as_object)
+        .and_then(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)));
+    Some(ApiError::RateLimitExceeded {
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("resettable quota rate limit reached")
+            .to_owned(),
+        retry_after,
+    })
 }
 
 fn try_parse_retry_delay(err: &Error) -> Option<Duration> {

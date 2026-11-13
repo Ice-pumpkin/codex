@@ -1,4 +1,5 @@
 use super::responses_error::parse_failed_response;
+use super::responses_error::parse_resettable_rate_limit_error;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
@@ -377,6 +378,13 @@ pub fn process_responses_event(
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "error" => {
+            if let Some(error) = event
+                .error
+                .as_ref()
+                .and_then(parse_resettable_rate_limit_error)
+            {
+                return Err(ResponsesEventError::Api(error));
+            }
             if let Some(error) =
                 parse_terminal_provider_error(event.error.as_ref(), /*status*/ None)
             {
@@ -1212,6 +1220,34 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         assert_matches!(events[0], Err(ApiError::QuotaExceeded));
+    }
+
+    #[tokio::test]
+    async fn resettable_quota_rate_limit_error_with_invalid_prompt_code_is_retryable() {
+        let detail = json!({
+            "type": "rate_limit_error",
+            "message": "每日额度超限: 当前 $17.1704 USD (限制: $17.0000 USD) 。将于 2026年11月14日 00:00:00 (Asia/Shanghai) 重置",
+            "code": "invalid_prompt",
+            "limit_type": "daily_quota",
+            "current": 17.1704,
+            "limit": 17.0,
+            "reset_time": "2026-11-13T16:00:00.000Z"
+        });
+
+        for failure in [
+            json!({ "type": "error", "error": detail.clone() }),
+            json!({ "type": "response.failed", "response": { "error": detail.clone() } }),
+        ] {
+            let sse = format!("data: {failure}\n\n");
+            let events = collect_events(&[sse.as_bytes()]).await;
+
+            assert_eq!(events.len(), 1);
+            assert_matches!(
+                &events[0],
+                Err(ApiError::RateLimitExceeded { message, .. })
+                    if message.contains("每日额度超限")
+            );
+        }
     }
 
     #[tokio::test]
