@@ -1,3 +1,96 @@
+diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
+index 07958ed..a84812f 100644
+--- a/codex-rs/codex-api/src/api_bridge.rs
++++ b/codex-rs/codex-api/src/api_bridge.rs
+@@ -20,6 +20,23 @@ use http::HeaderMap;
+ use serde::Deserialize;
+ use serde_json::Value;
+ 
++fn parse_resettable_rate_limit_quota_error(error: &Value) -> Option<DateTime<Utc>> {
++    if error.get("type").and_then(Value::as_str) != Some("rate_limit_error") {
++        return None;
++    }
++    if !error
++        .get("limit_type")
++        .and_then(Value::as_str)
++        .is_some_and(|limit_type| limit_type.to_ascii_lowercase().contains("quota"))
++    {
++        return None;
++    }
++    let reset_time = error.get("reset_time").and_then(Value::as_str)?;
++    DateTime::parse_from_rfc3339(reset_time)
++        .ok()
++        .map(|reset_time| reset_time.with_timezone(&Utc))
++}
++
+ pub fn map_api_error(err: ApiError) -> CodexErr {
+     let retry_after = match &err {
+         ApiError::Retryable { retry_after, .. }
+@@ -134,6 +151,18 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
+                 let body_text = body.unwrap_or_default();
+                 let parsed_body = serde_json::from_str::<Value>(&body_text).ok();
+                 let provider_error = parsed_body.as_ref().and_then(|body| body.get("error"));
++                if let Some(resets_at) =
++                    provider_error.and_then(parse_resettable_rate_limit_quota_error)
++                {
++                    return CodexErr::UsageLimitReached(UsageLimitReachedError {
++                        plan_type: None,
++                        resets_at: Some(resets_at),
++                        limit_window_minutes: None,
++                        rate_limits: None,
++                        promo_message: None,
++                        rate_limit_reached_type: None,
++                    });
++                }
+                 if let Some(error) = parse_terminal_provider_error(provider_error, Some(status)) {
+                     return map_api_error_details(error);
+                 }
+diff --git a/codex-rs/codex-api/src/api_bridge_tests.rs b/codex-rs/codex-api/src/api_bridge_tests.rs
+index 99bd0bc..359297e 100644
+--- a/codex-rs/codex-api/src/api_bridge_tests.rs
++++ b/codex-rs/codex-api/src/api_bridge_tests.rs
+@@ -5,6 +5,41 @@ use codex_protocol::protocol::CodexErrorInfo;
+ use codex_protocol::protocol::RateLimitReachedType;
+ use pretty_assertions::assert_eq;
+ 
++#[test]
++fn map_api_error_maps_resettable_quota_rate_limit_error() {
++    let body = serde_json::json!({
++        "error": {
++            "type": "rate_limit_error",
++            "message": "5�]5�P:+�u���S�w^~)�u $17.1704 USD *��y��yۧu���v: $17.0000 USD)5�N 202;�u���t1;�u���H1;�u���e 00:00:00 (Asia/Shanghai)+�u���M�w^~)�v",
++            "code": "invalid_prompt",
++            "limit_type": "daily_quota",
++            "current": 17.1704,
++            "limit": 17,
++            "reset_time": "2026-11-13T16:00:00.000Z"
++        }
++    })
++    .to_string();
++    let err = map_api_error(ApiError::Transport(TransportError::Http {
++        retry_after: None,
++        status: http::StatusCode::BAD_REQUEST,
++        url: Some("https://api.example.test/v1/responses".to_string()),
++        headers: None,
++        body: Some(body),
++    }));
++
++    let CodexErrorDetails::UsageLimitReached(error) = err.details() else {
++        panic!("expected resettable quota error, got {err:?}");
++    };
++    assert_eq!(
++        error.resets_at,
++        Some(
++            DateTime::parse_from_rfc3339("2026-11-13T16:00:00.000Z")
++                .unwrap()
++                .with_timezone(&Utc)
++        )
++    );
++}
++
+ #[test]
+ fn map_api_error_maps_server_overloaded() {
+     let err = map_api_error(ApiError::ServerOverloaded { retry_after: None });
 diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
 index 6a42146..7604863 100644
 --- a/codex-rs/core/src/responses_retry.rs
@@ -225,7 +318,7 @@ index 65aa293..fbdb7d3 100644
  async fn sampling_retry_logs_stream_error_context() {
      let (_session, turn_context) = make_session_and_context().await;
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 1bb4e51..2958898 100644
+index d775099..640ab9b 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -41,6 +41,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
@@ -236,7 +329,7 @@ index 1bb4e51..2958898 100644
  use crate::session::PreviousTurnSettings;
  use crate::session::TurnInput;
  use crate::session::daemon_recovery::RecordedTurnInput;
-@@ -2021,11 +2022,15 @@ async fn run_sampling_request(
+@@ -2030,11 +2031,15 @@ async fn run_sampling_request(
                      return Err(err);
                  }
                  CodexErrorDetails::UsageLimitReached(e) => {
@@ -251,10 +344,10 @@ index 1bb4e51..2958898 100644
 +                    }
 +                    err
                  }
-                 CodexErrorDetails::SessionBudgetExceeded | CodexErrorDetails::Fatal(_) => {
-                     return Err(err);
+                 CodexErrorDetails::SessionBudgetExceeded
+                 | CodexErrorDetails::InferenceHookDenied { .. }
 diff --git a/codex-rs/core/tests/suite/retry_after.rs b/codex-rs/core/tests/suite/retry_after.rs
-index 81bc8bc..7889283 100644
+index c2b1d6c..2cf6529 100644
 --- a/codex-rs/core/tests/suite/retry_after.rs
 +++ b/codex-rs/core/tests/suite/retry_after.rs
 @@ -50,6 +50,27 @@ const FIRST_RETRY_MAX_DELAY: Duration = Duration::from_millis(220);
@@ -860,7 +953,7 @@ index 81bc8bc..7889283 100644
      wait_for_turn_completion(&test).await;
  
      assert_eq!(response_mock.requests().len(), 2);
-@@ -1733,7 +1979,7 @@ async fn websocket_connection_limit_retries_with_local_backoff() -> Result<()> {
+@@ -1735,7 +1981,7 @@ async fn websocket_connection_limit_retries_with_local_backoff() -> Result<()> {
  
  /// WebSocket failed-event headers take precedence over plaintext during an allowed retry.
  #[tokio::test(flavor = "current_thread")]
@@ -869,7 +962,7 @@ index 81bc8bc..7889283 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1775,17 +2021,16 @@ async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Resu
+@@ -1777,17 +2023,16 @@ async fn websocket_failed_event_uses_header_over_plaintext_retry_after() -> Resu
      submit_user_input(&test, "retry the rate-limited websocket stream").await?;
  
      let retry = telemetry.next_retry().await;
@@ -889,7 +982,7 @@ index 81bc8bc..7889283 100644
      wait_for_turn_completion(&test).await;
  
      let connections = server.connections();
-@@ -1877,7 +2122,7 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
+@@ -1879,7 +2124,7 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
  
  /// Wrapped websocket rate limits honor nested advice.
  #[tokio::test(flavor = "current_thread")]
@@ -898,7 +991,7 @@ index 81bc8bc..7889283 100644
      skip_if_no_network!(Ok(()));
  
      let mut telemetry = RetryTelemetryCapture::install();
-@@ -1921,7 +2166,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+@@ -1923,7 +2168,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
      assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
      submit_user_input(&test, "recover from the websocket error").await?;
      let retry = telemetry.next_retry().await;
@@ -907,7 +1000,7 @@ index 81bc8bc..7889283 100644
      assert_eq!(
          (
              retry.attempt,
-@@ -1930,7 +2175,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+@@ -1932,7 +2177,7 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
          ),
          (1, "stream", "sampling")
      );
@@ -916,7 +1009,7 @@ index 81bc8bc..7889283 100644
      wait_for_turn_completion(&test).await;
      assert_eq!(
          server
-@@ -1949,32 +2194,39 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
+@@ -1951,32 +2196,39 @@ async fn websocket_error_uses_nested_retry_after() -> Result<()> {
      Ok(())
  }
  
@@ -972,7 +1065,7 @@ index 81bc8bc..7889283 100644
          })
          .build_with_websocket_server(&server)
          .await?;
-@@ -1985,37 +2237,26 @@ async fn websocket_rate_limit_without_retry_after_is_terminal() -> Result<()> {
+@@ -1987,37 +2239,26 @@ async fn websocket_rate_limit_without_retry_after_is_terminal() -> Result<()> {
      assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
      submit_user_input(&test, "surface the headerless websocket rate limit").await?;
  
@@ -1029,94 +1122,3 @@ index 81bc8bc..7889283 100644
      assert_eq!(
          telemetry.events.try_recv(),
          Err(mpsc::error::TryRecvError::Empty)
-diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
---- a/codex-rs/codex-api/src/api_bridge.rs
-+++ b/codex-rs/codex-api/src/api_bridge.rs
-@@ -18,6 +18,23 @@
- use http::HeaderMap;
- use serde::Deserialize;
- use serde_json::Value;
-+
-+fn parse_resettable_rate_limit_quota_error(error: &Value) -> Option<DateTime<Utc>> {
-+    if error.get("type").and_then(Value::as_str) != Some("rate_limit_error") {
-+        return None;
-+    }
-+    if !error
-+        .get("limit_type")
-+        .and_then(Value::as_str)
-+        .is_some_and(|limit_type| limit_type.to_ascii_lowercase().contains("quota"))
-+    {
-+        return None;
-+    }
-+    let reset_time = error.get("reset_time").and_then(Value::as_str)?;
-+    DateTime::parse_from_rfc3339(reset_time)
-+        .ok()
-+        .map(|reset_time| reset_time.with_timezone(&Utc))
-+}
- 
- pub fn map_api_error(err: ApiError) -> CodexErr {
-     let retry_after = match &err {
-@@ -121,6 +138,18 @@
-                 let body_text = body.unwrap_or_default();
-                 let parsed_body = serde_json::from_str::<Value>(&body_text).ok();
-                 let provider_error = parsed_body.as_ref().and_then(|body| body.get("error"));
-+                if let Some(resets_at) =
-+                    provider_error.and_then(parse_resettable_rate_limit_quota_error)
-+                {
-+                    return CodexErr::UsageLimitReached(UsageLimitReachedError {
-+                        plan_type: None,
-+                        resets_at: Some(resets_at),
-+                        limit_window_minutes: None,
-+                        rate_limits: None,
-+                        promo_message: None,
-+                        rate_limit_reached_type: None,
-+                    });
-+                }
-                 if let Some(error) = parse_terminal_provider_error(provider_error, Some(status)) {
-                     return map_api_error_details(error);
-                 }
-diff --git a/codex-rs/codex-api/src/api_bridge_tests.rs b/codex-rs/codex-api/src/api_bridge_tests.rs
---- a/codex-rs/codex-api/src/api_bridge_tests.rs
-+++ b/codex-rs/codex-api/src/api_bridge_tests.rs
-@@ -4,6 +4,41 @@
- use codex_protocol::protocol::CodexErrorInfo;
- use codex_protocol::protocol::RateLimitReachedType;
- use pretty_assertions::assert_eq;
-+
-+#[test]
-+fn map_api_error_maps_resettable_quota_rate_limit_error() {
-+    let body = serde_json::json!({
-+        "error": {
-+            "type": "rate_limit_error",
-+            "message": "5�]5�P:+�u���S�w^~)�u $17.1704 USD *��y��yۧu���v: $17.0000 USD)5�N 202;�u���t1;�u���H1;�u���e 00:00:00 (Asia/Shanghai)+�u���M�w^~)�v",
-+            "code": "invalid_prompt",
-+            "limit_type": "daily_quota",
-+            "current": 17.1704,
-+            "limit": 17,
-+            "reset_time": "2026-11-13T16:00:00.000Z"
-+        }
-+    })
-+    .to_string();
-+    let err = map_api_error(ApiError::Transport(TransportError::Http {
-+        retry_after: None,
-+        status: http::StatusCode::BAD_REQUEST,
-+        url: Some("https://api.example.test/v1/responses".to_string()),
-+        headers: None,
-+        body: Some(body),
-+    }));
-+
-+    let CodexErrorDetails::UsageLimitReached(error) = err.details() else {
-+        panic!("expected resettable quota error, got {err:?}");
-+    };
-+    assert_eq!(
-+        error.resets_at,
-+        Some(
-+            DateTime::parse_from_rfc3339("2026-11-13T16:00:00.000Z")
-+                .unwrap()
-+                .with_timezone(&Utc)
-+        )
-+    );
-+}
- 
- #[test]
- fn map_api_error_maps_server_overloaded() {
