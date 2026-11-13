@@ -1122,3 +1122,100 @@ index c2b1d6c..2cf6529 100644
      assert_eq!(
          telemetry.events.try_recv(),
          Err(mpsc::error::TryRecvError::Empty)
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+index 055feec..94cb765 100644
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -1214,6 +1214,39 @@ mod tests {
+         assert_matches!(events[0], Err(ApiError::QuotaExceeded));
+     }
+ 
++    #[tokio::test]
++    async fn resettable_quota_rate_limit_error_with_invalid_prompt_code_is_retryable() {
++        let raw_error = serde_json::json!({
++            "type": "response.failed",
++            "sequence_number": 3,
++            "response": {
++                "id": "resp_resettable_quota",
++                "object": "response",
++                "status": "failed",
++                "error": {
++                    "type": "rate_limit_error",
++                    "message": "每日额度超限: 当前 $17.1704 USD (限制: $17.0000 USD) 。将于 2026年11月14日 00:00:00 (Asia/Shanghai) 重置",
++                    "code": "invalid_prompt",
++                    "limit_type": "daily_quota",
++                    "current": 17.1704,
++                    "limit": 17.0,
++                    "reset_time": "2026-11-13T16:00:00.000Z"
++                }
++            }
++        })
++        .to_string();
++
++        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
++        let events = collect_events(&[sse.as_bytes()]).await;
++
++        assert_eq!(events.len(), 1);
++        assert_matches!(
++            &events[0],
++            Err(ApiError::RateLimitExceeded { message, .. })
++                if message.contains("每日额度超限")
++        );
++    }
++
+     #[tokio::test]
+     async fn cyber_policy_error_is_fatal() {
+         let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_fatal_cyber","object":"response","created_at":1759771626,"status":"failed","background":false,"error":{"code":"cyber_policy","message":"This request was flagged for cyber policy."},"incomplete_details":null}}"#;
+diff --git a/codex-rs/codex-api/src/sse/responses_error.rs b/codex-rs/codex-api/src/sse/responses_error.rs
+index 09c1f41..684449f 100644
+--- a/codex-rs/codex-api/src/sse/responses_error.rs
++++ b/codex-rs/codex-api/src/sse/responses_error.rs
+@@ -4,6 +4,7 @@
+ use crate::error::ApiError;
+ use crate::error::parse_terminal_provider_error;
+ use crate::responses_headers::json_headers_to_http_headers;
++use chrono::DateTime;
+ use codex_http_client::RetryAfter;
+ use codex_protocol::protocol::MisalignmentErrorDetails;
+ use serde::Deserialize;
+@@ -29,6 +30,16 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
+         .and_then(|error| error.get("headers"))
+         .and_then(Value::as_object)
+         .and_then(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)));
++    if let Some(error) = error.filter(|error| is_resettable_rate_limit_quota_error(error)) {
++        return ApiError::RateLimitExceeded {
++            message: error
++                .get("message")
++                .and_then(Value::as_str)
++                .unwrap_or("resettable quota rate limit reached")
++                .to_owned(),
++            retry_after: retry_after_header,
++        };
++    }
+     if let Some(error) = parse_terminal_provider_error(error, /*status*/ None) {
+         return error;
+     }
+@@ -105,6 +116,23 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
+     }
+ }
+ 
++fn is_resettable_rate_limit_quota_error(error: &Value) -> bool {
++    if error.get("type").and_then(Value::as_str) != Some("rate_limit_error") {
++        return false;
++    }
++    if !error
++        .get("limit_type")
++        .and_then(Value::as_str)
++        .is_some_and(|limit_type| limit_type.to_ascii_lowercase().contains("quota"))
++    {
++        return false;
++    }
++    error
++        .get("reset_time")
++        .and_then(Value::as_str)
++        .is_some_and(|reset_time| DateTime::parse_from_rfc3339(reset_time).is_ok())
++}
++
+ fn try_parse_retry_delay(err: &Error) -> Option<Duration> {
+     let re = rate_limit_regex();
+     if let Some(message) = &err.message

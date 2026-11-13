@@ -51,7 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
-          REBUILD: ${{ inputs.rebuild }}
+          REBUILD: ${{ inputs.rebuild || github.event_name == 'push' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
@@ -253,6 +253,7 @@ jobs:
           cargo test -p codex-core --test all retry_after:: --no-fail-fast
           cargo test -p codex-core --lib responses_retry::tests::
           cargo test -p codex-api --lib map_api_error_maps_resettable_quota_rate_limit_error
+          cargo test -p codex-api --lib resettable_quota_rate_limit_error_with_invalid_prompt_code_is_retryable
 
       - name: Configure the Rusty V8 build inputs
         env:
