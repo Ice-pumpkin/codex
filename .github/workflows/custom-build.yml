@@ -12,6 +12,8 @@ on:
       - scripts/package_custom_build.py
       - scripts/test_package_custom_build.py
       - scripts/setup-rusty-v8.sh
+      - scripts/patch_musl_libcap_fallback.py
+      - scripts/test_patch_musl_libcap_fallback.py
   schedule:
     - cron: "17 8 * * *"
   workflow_dispatch:
@@ -145,6 +147,8 @@ jobs:
             scripts/package_custom_build.py
             scripts/test_package_custom_build.py
             scripts/setup-rusty-v8.sh
+            scripts/patch_musl_libcap_fallback.py
+            scripts/test_patch_musl_libcap_fallback.py
             README-custom-build.md
             LICENSE
             NOTICE
@@ -264,29 +268,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          script = Path("../.github/scripts/install-musl-build-tools.sh")
-          original = script.read_text(encoding="utf-8")
-          import re
-
-          source = re.compile(
-              r'(?m)^(?P<indent>\s*)curl -fsSL "\$\{libcap_download_url\}" '
-              r'-o "\$\{libcap_tarball\}"\s*$'
-          )
-          replacement = '''  if ! curl --connect-timeout 20 --max-time 180 -fsSL "${libcap_download_url}" -o "${libcap_tarball}"; then
-              echo "Primary libcap mirror is unavailable; trying www.kernel.org." >&2
-              curl --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors --retry-delay 2 -fsSL \\
-                "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/${libcap_tarball_name}" \\
-                -o "${libcap_tarball}"
-            fi'''
-          if 'Primary libcap mirror is unavailable; trying www.kernel.org.' not in original:
-              updated, count = source.subn(replacement, original, count=1)
-              if count != 1:
-                  raise SystemExit("Could not find the libcap download command in the upstream script.")
-              script.write_text(updated, encoding="utf-8")
-          PY
+          python ../automation/scripts/test_patch_musl_libcap_fallback.py
+          python ../automation/scripts/patch_musl_libcap_fallback.py \
+            --source ../.github/scripts/install-musl-build-tools.sh
           bash ../.github/scripts/install-musl-build-tools.sh
 
       - name: Configure Linux musl environment
