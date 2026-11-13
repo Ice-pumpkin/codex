@@ -252,6 +252,7 @@ jobs:
         run: |
           cargo test -p codex-core --test all retry_after:: --no-fail-fast
           cargo test -p codex-core --lib responses_retry::tests::
+          cargo test -p codex-api --lib map_api_error_maps_resettable_quota_rate_limit_error
 
       - name: Configure the Rusty V8 build inputs
         env:
