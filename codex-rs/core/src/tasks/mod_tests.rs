@@ -257,11 +257,12 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
     session
         .update_token_usage_info(
             &previous_context,
-            Some(&TokenUsage {
+            TokenUsage {
                 input_tokens: 1_000,
                 total_tokens: 1_000,
                 ..TokenUsage::default()
-            }),
+            }
+            .into(),
             /*includes_reasoning*/ false,
         )
         .await
@@ -287,7 +288,7 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
         session
             .update_token_usage_info(
                 &previous_context,
-                Some(&compaction_usage),
+                compaction_usage.clone().into(),
                 /*includes_reasoning*/ false,
             )
             .await
@@ -320,7 +321,7 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
                 .record_token_usage_info(
                     &turn_context,
                     &response_context.initial_settings,
-                    Some(&response_usage),
+                    response_usage.clone().into(),
                     crate::session::TokenUsageContext::Sampling {
                         includes_reasoning: false,
                         input_item_count: 0,
@@ -675,7 +676,10 @@ async fn turn_critical_path_metrics_count_each_capture_once() {
     let complete = TurnCriticalPath::Complete(TurnCriticalPathDurations {
         duration_ms: 60,
         inference_ms: 31,
+        sampling_ms: 31,
+        compaction_ms: 0,
         auto_review_ms: 2,
+        auto_review_overhead_ms: None,
         tools_ms: 10,
         user_wait_ms: 0,
         overhead_ms: 14,
