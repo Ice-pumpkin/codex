@@ -8,7 +8,7 @@ on:
     paths:
       - .github/workflows/custom-build.yml
       - install/**
-      - patches/**
+      - patches/immediate-rate-limit-retry.patch
       - scripts/package_custom_build.py
       - scripts/test_package_custom_build.py
       - scripts/setup-rusty-v8.sh
@@ -51,7 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
-          REBUILD: ${{ inputs.rebuild || github.event_name == 'push' }}
+          REBUILD: ${{ inputs.rebuild || (github.event_name == 'push' && contains(github.event.head_commit.modified, 'patches/immediate-rate-limit-retry.patch')) }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
