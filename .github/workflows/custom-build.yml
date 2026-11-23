@@ -198,18 +198,26 @@ jobs:
         run: |
           set -euo pipefail
           toolchain="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("codex-rs/rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          components="$(python3 -c 'import pathlib, tomllib; print(" ".join(tomllib.loads(pathlib.Path("codex-rs/rust-toolchain.toml").read_text())["toolchain"].get("components", [])))')"
           if [[ ! "$toolchain" =~ ^(stable|beta|nightly|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             echo "Unsupported Rust toolchain in codex-rs/rust-toolchain.toml: $toolchain" >&2
             exit 1
           fi
           echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+          echo "components=$components" >> "$GITHUB_OUTPUT"
           echo "CODEX_RUST_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          echo "CODEX_RUST_COMPONENTS=$components" >> "$GITHUB_ENV"
 
       - name: Install the upstream Rust toolchain
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
-        with:
-          toolchain: ${{ steps.rust_toolchain.outputs.toolchain }}
-          targets: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$CODEX_RUST_TOOLCHAIN" --profile minimal
+          if [[ -n "$CODEX_RUST_COMPONENTS" ]]; then
+            read -r -a components <<< "$CODEX_RUST_COMPONENTS"
+            rustup component add --toolchain "$CODEX_RUST_TOOLCHAIN" "${components[@]}"
+          fi
+          rustup target add --toolchain "$CODEX_RUST_TOOLCHAIN" "$CODEX_TARGET"
 
       - name: Enable Windows long paths
         if: runner.os == 'Windows'
@@ -234,8 +242,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup show active-toolchain
-          rustup target add --toolchain "$CODEX_RUST_TOOLCHAIN" "$CODEX_TARGET"
+          rustc "+$CODEX_RUST_TOOLCHAIN" --version
           rustup target list --toolchain "$CODEX_RUST_TOOLCHAIN" --installed | grep -Fx "$CODEX_TARGET"
           target_libdir="$(rustc "+$CODEX_RUST_TOOLCHAIN" --print target-libdir --target "$CODEX_TARGET")"
           compgen -G "${target_libdir}/libcore-*.rlib" >/dev/null || {
