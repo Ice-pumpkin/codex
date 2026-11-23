@@ -12,6 +12,7 @@ use crate::transcript::required;
 use crate::transcript_wire::Envelope;
 use crate::transcript_wire::SelectedMessages;
 use crate::transcript_wire::merge_messages;
+use prost::Message;
 use std::fmt;
 
 /// Lifecycle identity and timestamp for a typed item event.
@@ -33,6 +34,7 @@ pub enum ItemSummary {
     AgentMessage {
         id: String,
         text: String,
+        phase: Option<AgentMessagePhase>,
         questions: Option<Vec<AgentQuestion>>,
     },
     Reasoning {
@@ -47,6 +49,15 @@ pub enum ItemSummary {
         status: ItemStatus,
     },
 }
+
+/// Phase explicitly supplied in a native agent message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMessagePhase {
+    Commentary,
+    FinalAnswer,
+    PartialAnswer,
+}
+
 /// A structured question attached to an agent message.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentQuestion {
@@ -221,6 +232,17 @@ pub(crate) fn summary(item: wire::Item) -> Result<Option<ItemSummary>, DecodeFai
                         };
                         UserMessageInput::Image { image, detail }
                     }
+                    Some(crate::turns_wire::Value::Mention(bytes)) => {
+                        // Keep an undecodable mention local to this item in history and live events.
+                        let Ok(crate::turns_wire::Mention {
+                            name: Some(name),
+                            path: Some(path),
+                        }) = crate::turns_wire::Mention::decode(bytes.as_slice())
+                        else {
+                            return Ok(None);
+                        };
+                        UserMessageInput::Mention { name, path }
+                    }
                     _ => return Ok(None),
                 };
                 content.push(input);
@@ -234,6 +256,16 @@ pub(crate) fn summary(item: wire::Item) -> Result<Option<ItemSummary>, DecodeFai
         Some(wire::Value::AgentMessage(value)) => ItemSummary::AgentMessage {
             id: required(value.id)?,
             text: required(value.text)?,
+            phase: match value.phase.and_then(|phase| phase.value) {
+                Some(wire::MessagePhaseValue::Commentary(1)) => Some(AgentMessagePhase::Commentary),
+                Some(wire::MessagePhaseValue::FinalAnswer(1)) => {
+                    Some(AgentMessagePhase::FinalAnswer)
+                }
+                Some(wire::MessagePhaseValue::PartialAnswer(1)) => {
+                    Some(AgentMessagePhase::PartialAnswer)
+                }
+                Some(_) | None => None,
+            },
             questions: value
                 .questions
                 .map(|questions| {

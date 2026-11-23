@@ -3,7 +3,7 @@ use super::*;
 use pretty_assertions::assert_eq;
 use prost::Message;
 
-const AGENT: &[u8] = b"\x1a\x06\x12\x01i\x32\x01d";
+const AGENT: &[u8] = b"\x1a\x0a\x12\x01i\x22\x02\x10\x01\x32\x01d";
 
 const COMMAND: &[u8] =
     b"\x0a\x00\x12\x01c\x1a\x07\x0a\x05\x22\x03\x0a\x01c\x22\x01w\x28\x00\x30\x00\x3a\x01i\x60\x03";
@@ -53,6 +53,7 @@ async fn item_lifecycle_keeps_identity_and_timestamps() {
         item: ItemSummary::AgentMessage {
             id: "i".into(),
             text: "d".into(),
+            phase: Some(AgentMessagePhase::FinalAnswer),
             questions: None,
         },
     };
@@ -97,7 +98,7 @@ fn user_message_preserves_client_id_and_text() {
 }
 
 #[test]
-fn user_message_preserves_images_spans_and_client_id() {
+fn user_message_preserves_images_spans_mentions_and_client_id() {
     let url = "data:image/png;base64,AA==";
     let label = "[Image #1]";
     let element = [
@@ -111,12 +112,18 @@ fn user_message_preserves_images_spans_and_client_id() {
     ]
     .concat();
     let image_bytes = [vec![0x08, 99], message(/*tag*/ 2, url.as_bytes())].concat();
+    let mention = [
+        message(/*tag*/ 1, b"Example"),
+        message(/*tag*/ 2, b"plugin://plugins~Plugin_example"),
+    ]
+    .concat();
     let content = [
         message(/*tag*/ 1, &message(/*tag*/ 1, &text)),
         message(
             /*tag*/ 1,
             &message(/*tag*/ 2, &message(/*tag*/ 1, &image_bytes)),
         ),
+        message(/*tag*/ 1, &message(/*tag*/ 7, &mention)),
     ]
     .concat();
     let user = message(
@@ -143,6 +150,10 @@ fn user_message_preserves_images_spans_and_client_id() {
             UserMessageInput::Image {
                 image: ImageReference::Url(url.into()),
                 detail: None,
+            },
+            UserMessageInput::Mention {
+                name: "Example".into(),
+                path: "plugin://plugins~Plugin_example".into(),
             },
         ],
     };
@@ -297,6 +308,7 @@ fn agent_messages_keep_questions_with_empty_text() {
             Some(ItemSummary::AgentMessage {
                 id: "i".into(),
                 text: String::new(),
+                phase: None,
                 questions: Some(expected),
             })
         );
@@ -334,6 +346,9 @@ fn unsupported_and_incomplete_items_stay_opaque() {
         message(/*tag*/ 2, &message(/*tag*/ 3, b"")),         // Future image reference.
         message(/*tag*/ 2, &message(/*tag*/ 1, b"\x08\x01")), // Missing URL.
         message(/*tag*/ 2, &message(/*tag*/ 2, b"")),         // Missing file ID.
+        message(/*tag*/ 7, b"\xff"),                          // Malformed mention payload.
+        message(/*tag*/ 7, &message(/*tag*/ 2, b"plugin://x")), // Missing mention name.
+        message(/*tag*/ 7, &message(/*tag*/ 1, b"Example")),  // Missing mention path.
         message(
             /*tag*/ 1,
             &[
@@ -388,6 +403,7 @@ fn item_summaries_redact_sensitive_fields() {
         questions: None,
         id: "secret".into(),
         text: "secret".into(),
+        phase: None,
     };
     let text = format!("{item:?}");
     assert_eq!(text, "ItemSummary([redacted])");
