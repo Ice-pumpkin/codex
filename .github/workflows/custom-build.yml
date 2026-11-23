@@ -209,10 +209,26 @@ jobs:
         run: |
           set -euo pipefail
           cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          rustup_home="${HOME}/.rustup"
           mkdir -p "${cargo_home}/bin"
           echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${rustup_home}" >> "$GITHUB_ENV"
           echo "${cargo_home}/bin" >> "$GITHUB_PATH"
           : > "${cargo_home}/config.toml"
+
+      - name: Install and verify the Linux musl Rust target
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustup target add --toolchain 1.95.0 "$CODEX_TARGET"
+          rustup target list --toolchain 1.95.0 --installed | grep -Fx "$CODEX_TARGET"
+          target_libdir="$(rustc +1.95.0 --print target-libdir --target "$CODEX_TARGET")"
+          compgen -G "${target_libdir}/libcore-*.rlib" >/dev/null || {
+            echo "Rust core library is missing from ${target_libdir}" >&2
+            exit 1
+          }
 
       - name: Install Zig for the Linux musl build
         if: runner.os == 'Linux'
